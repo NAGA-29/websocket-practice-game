@@ -1,0 +1,15 @@
+{
+  "name": "square-shooter-game",
+  "version": "1.0.0",
+  "description": "A multiplayer square shooting game",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "start": "http-server -p 8080 --cors -c-1"
+  },
+  "devDependencies": {
+    "http-server": "^14.1.1",
+    "typescript": "^5.0.4"
+  }
+} 
