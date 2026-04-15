@@ -29,9 +29,13 @@ type GameState struct {
 
 // Room はルーム内の接続クライアントを管理する
 type Room struct {
-	mu      sync.Mutex
-	clients map[*Client]bool
+	hub       *Hub
+	id        string
+	mu        sync.Mutex
+	clients   map[*Client]bool
 	broadcast chan []byte
+	closed    bool
+	closeOnce sync.Once
 }
 
 // Client はWebSocket接続を表す
@@ -55,6 +59,13 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+const (
+	writeWait      = 10 * time.Second
+	pongWait       = 60 * time.Second
+	pingPeriod     = (pongWait * 9) / 10
+	maxMessageSize = 5120
+)
+
 func newHub() *Hub {
 	return &Hub{
 		rooms:        make(map[string]*Room),
@@ -73,6 +84,8 @@ func (h *Hub) getOrCreateRoom(roomID string) *Room {
 	}
 
 	room := &Room{
+		hub:       h,
+		id:        roomID,
 		clients:   make(map[*Client]bool),
 		broadcast: make(chan []byte, 256),
 	}
@@ -105,6 +118,36 @@ func (r *Room) run() {
 	}
 }
 
+func (r *Room) enqueueBroadcast(msg []byte) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	select {
+	case r.broadcast <- msg:
+		return true
+	default:
+		return false
+	}
+}
+
+func (r *Room) closeAndUnregister() {
+	r.hub.mu.Lock()
+	defer r.hub.mu.Unlock()
+
+	r.mu.Lock()
+	r.closeOnce.Do(func() {
+		r.closed = true
+		close(r.broadcast)
+	})
+	r.mu.Unlock()
+
+	delete(r.hub.rooms, r.id)
+	delete(r.hub.gameStates, r.id)
+	delete(r.hub.playerStates, r.id)
+}
+
 // addClient はクライアントをルームに追加する
 func (r *Room) addClient(client *Client) {
 	r.mu.Lock()
@@ -114,11 +157,19 @@ func (r *Room) addClient(client *Client) {
 
 // removeClient はクライアントをルームから削除する
 func (r *Room) removeClient(client *Client) {
+	shouldClose := false
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if _, ok := r.clients[client]; ok {
 		delete(r.clients, client)
 		close(client.send)
+		if len(r.clients) == 0 {
+			shouldClose = true
+		}
+	}
+	r.mu.Unlock()
+
+	if shouldClose {
+		r.closeAndUnregister()
 	}
 }
 
@@ -128,6 +179,12 @@ func (c *Client) readPump() {
 		c.room.removeClient(c)
 		c.conn.Close()
 	}()
+
+	c.conn.SetReadLimit(maxMessageSize)
+	c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
 
 	for {
 		_, message, err := c.conn.ReadMessage()
@@ -143,23 +200,41 @@ func (c *Client) readPump() {
 		if err := json.Unmarshal(message, &data); err == nil {
 			if msgType, ok := data["type"].(string); ok && msgType == "hit" {
 				// 衝突情報を全クライアントに転送
-				c.room.broadcast <- message
+				c.room.enqueueBroadcast(message)
 				continue
 			}
 		}
 
-		c.room.broadcast <- message
+		c.room.enqueueBroadcast(message)
 	}
 }
 
 // writePump はクライアントへメッセージを送信する
 func (c *Client) writePump() {
-	defer c.conn.Close()
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.room.removeClient(c)
+		c.conn.Close()
+	}()
 
-	for msg := range c.send {
-		if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-			log.Printf("websocket send error: %v", err)
-			return
+	for {
+		select {
+		case msg, ok := <-c.send:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+				log.Printf("websocket send error: %v", err)
+				return
+			}
+		case <-ticker.C:
+			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
@@ -222,15 +297,12 @@ func (h *Hub) processGameStates() {
 				"remaining": int(remaining.Seconds()),
 			}
 			if data, err := json.Marshal(msg); err == nil {
-				select {
-				case room.broadcast <- data:
-				default:
-				}
+				room.enqueueBroadcast(data)
 			}
 		}
 	}
 
-	// ゲーム終了処理（ロック外で行う必要があるためここで実行）
+	// ゲーム終了処理
 	for _, info := range endedRooms {
 		h.startNewGameLocked(info.roomID, info.room)
 	}
@@ -238,6 +310,28 @@ func (h *Hub) processGameStates() {
 
 // startNewGameLocked は新しいゲームを開始する（mu がロック済みの前提）
 func (h *Hub) startNewGameLocked(roomID string, room *Room) {
+	if prev, ok := h.gameStates[roomID]; ok && !prev.StartTime.IsZero() && prev.Duration > 0 {
+		elapsed := time.Since(prev.StartTime)
+		if elapsed > prev.Duration {
+			elapsed = prev.Duration
+		}
+
+		finalScores := make(map[string]int, len(prev.Scores))
+		for k, v := range prev.Scores {
+			finalScores[k] = v
+		}
+
+		endMsg := map[string]interface{}{
+			"type":     "game_end",
+			"scores":   finalScores,
+			"duration": int(prev.Duration.Seconds()),
+			"elapsed":  int(elapsed.Seconds()),
+		}
+		if data, err := json.Marshal(endMsg); err == nil {
+			room.enqueueBroadcast(data)
+		}
+	}
+
 	newState := &GameState{
 		Mode:      "deathmatch",
 		StartTime: time.Now(),
@@ -252,10 +346,7 @@ func (h *Hub) startNewGameLocked(roomID string, room *Room) {
 		"duration": 300,
 	}
 	if data, err := json.Marshal(msg); err == nil {
-		select {
-		case room.broadcast <- data:
-		default:
-		}
+		room.enqueueBroadcast(data)
 	}
 }
 
