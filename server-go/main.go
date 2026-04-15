@@ -77,6 +77,10 @@ func (h *Hub) getOrCreateRoom(roomID string) *Room {
 		broadcast: make(chan []byte, 256),
 	}
 	h.rooms[roomID] = room
+	h.gameStates[roomID] = &GameState{
+		Scores: make(map[string]int),
+	}
+	h.startNewGameLocked(roomID, room)
 
 	// ルームのブロードキャストループを起動
 	go room.run()
